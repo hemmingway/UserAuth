@@ -42,6 +42,12 @@ bool UserAuth::login(const QString& username, const QString& password, const QSt
 		return false;
 	}
 
+	// 新增显式锁定检查
+	if (info.isLocked) {
+		emit loginFailed(LoginError::AccountLocked, tr("账户已锁定"));
+		return false;
+	}
+
 	// 检查账户锁定
 	if (m_failedAttempts.value(username, 0) >= 5) {
 		emit loginFailed(LoginError::AccountLocked, tr("账户已锁定"));
@@ -131,6 +137,101 @@ QList<QString> UserAuth::getAllUsers() const
 	return m_users.keys();
 }
 
+//--- 获取扩展用户信息 ---
+UserAuth::UserInfoEx UserAuth::getUserInfoEx(const QString& username) const {
+	QMutexLocker locker(&m_userMutex);
+	UserInfoEx infoEx;
+
+	auto it = m_users.constFind(username);
+	if (it == m_users.constEnd()) {
+		qWarning() << "用户不存在：" << username;
+		return infoEx;
+	}
+
+	// 一次性读取所有元数据键值对
+	m_secureStorage.beginGroup("Users/" + username);
+	QMap<QString, QVariant> metadata = m_secureStorage.value("metadata").toMap();
+	m_secureStorage.endGroup();
+
+	// 基础信息
+	const UserInfo& info = it.value();
+	infoEx.role = info.role;
+	infoEx.requiresMFA = info.requiresMFA;
+	infoEx.forcePasswordReset = info.forcePasswordReset;
+	infoEx.isLocked = (m_failedAttempts.value(username, 0) >= 5);
+
+	// 从元数据中提取时间字段
+	infoEx.lastLoginTime = metadata.value("lastLogin").toDateTime();
+	infoEx.accountCreatedTime = metadata.value("createdTime").toDateTime();
+	infoEx.passwordLastChanged = metadata.value("pwdChangedTime").toDateTime();
+
+	return infoEx;
+}
+
+QList<QString> UserAuth::getUsers(int page, int pageSize, const QString& keyword) const {
+	QMutexLocker locker(&m_userMutex);
+	QList<QString> filteredUsers;
+	int start = (page - 1) * pageSize;
+	int count = 0;
+
+	foreach(const QString & user, m_users.keys()) {
+		UserInfoEx info = getUserInfoEx(user);
+		bool match = keyword.isEmpty()
+			|| user.contains(keyword, Qt::CaseInsensitive)
+			|| roleToString(info.role).contains(keyword, Qt::CaseInsensitive);
+
+		if (match) {
+			if (count >= start && count < start + pageSize) {
+				filteredUsers.append(user);
+			}
+			count++;
+		}
+	}
+	return filteredUsers;
+}
+
+int UserAuth::getUserCount(const QString& keyword) const {
+	QMutexLocker locker(&m_userMutex);
+	if (keyword.isEmpty()) return m_users.size();
+
+	int count = 0;
+	foreach(const QString & user, m_users.keys()) {
+		UserInfoEx info = getUserInfoEx(user);
+		if (user.contains(keyword, Qt::CaseInsensitive)
+			|| roleToString(info.role).contains(keyword, Qt::CaseInsensitive)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+//--- 记录登录时间 ---
+void UserAuth::recordLoginTime(const QString& username) {
+	QMutexLocker locker(&m_userMutex);
+	if (!m_users.contains(username)) return;
+
+	QDateTime currentTime = QDateTime::currentDateTime();
+	m_secureStorage.beginGroup("Users/" + username);
+	m_secureStorage.setValue("lastLogin", currentTime);
+	m_secureStorage.endGroup();
+}
+
+//--- 初始化账户创建时间（在创建用户时调用）---
+void UserAuth::initializeUserMetadata(const QString& username) {
+	QMutexLocker locker(&m_userMutex);
+	m_secureStorage.beginGroup("Users/" + username);
+
+	QMap<QString, QVariant> metadata;
+	if (!m_secureStorage.contains("metadata")) {
+		QDateTime now = QDateTime::currentDateTime();
+		metadata["createdTime"] = now;
+		metadata["pwdChangedTime"] = now; // 初始密码时间
+		m_secureStorage.setValue("metadata", metadata);
+	}
+
+	m_secureStorage.endGroup();
+}
+
 //--- 设置用户角色（仅管理员）---
 bool UserAuth::setUserRole(const QString& username, Role newRole)
 {
@@ -168,6 +269,71 @@ bool UserAuth::setUserRole(const QString& username, Role newRole)
 
 	emit userUpdated(username); // 触发更新信号
 	logActivity(QString("修改用户角色：%1 -> %2").arg(username).arg(newRole));
+	return true;
+}
+
+bool UserAuth::updateUser(const QString& username, Role newRole, bool mfaEnabled, bool isLocked) {
+	QMutexLocker locker(&m_userMutex);
+
+	// 1. 权限检查：仅管理员可操作
+	if (!hasPermission(Admin)) {
+		qWarning() << "权限不足，需要管理员权限";
+		return false;
+	}
+
+	// 2. 用户存在性检查
+	if (!m_users.contains(username)) {
+		qWarning() << "用户不存在：" << username;
+		return false;
+	}
+
+	// 3. 获取用户信息并更新
+	UserInfo& userInfo = m_users[username];
+	bool changed = false;
+
+	// 更新角色
+	if (userInfo.role != newRole) {
+		userInfo.role = newRole;
+		changed = true;
+	}
+
+	// 更新MFA状态
+	if (userInfo.requiresMFA != mfaEnabled) {
+		userInfo.requiresMFA = mfaEnabled;
+		changed = true;
+	}
+
+	// 更新锁定状态
+	if (userInfo.isLocked != isLocked) {
+		userInfo.isLocked = isLocked;
+		changed = true;
+		// 若解锁，清空失败次数
+		if (!isLocked) m_failedAttempts.remove(username);
+	}
+
+	// 4. 若没有实际修改，直接返回
+	if (!changed) {
+		qInfo() << "用户信息未发生变化";
+		return true;
+	}
+
+	// 5. 持久化存储更新
+	m_secureStorage.beginGroup("Users");
+	m_secureStorage.beginGroup(username);
+	m_secureStorage.setValue("role", static_cast<int>(userInfo.role));
+	m_secureStorage.setValue("mfa", userInfo.requiresMFA);
+	m_secureStorage.setValue("locked", userInfo.isLocked);
+	m_secureStorage.endGroup(); // username
+	m_secureStorage.endGroup(); // Users
+
+	// 6. 记录审计日志
+	QString log = QString("更新用户[%1]: 角色=%2, MFA=%3, 锁定=%4")
+		.arg(username)
+		.arg(newRole)
+		.arg(mfaEnabled ? "启用" : "禁用")
+		.arg(isLocked ? "是" : "否");
+	logActivity(log);
+
 	return true;
 }
 
@@ -210,6 +376,10 @@ bool UserAuth::createUser(const QString& user, Role role, const QString& tempPas
 		qCritical() << "用户存储失败！磁盘可能写保护";
 		m_users.remove(user);
 		return false;
+	}
+	else {
+		//
+		initializeUserCreationTime(user);
 	}
 
 	m_users[user] = info;
@@ -288,6 +458,11 @@ bool UserAuth::resetPassword(const QString& user, const QString& newPassword)
 	m_secureStorage.setValue(user + "/hash", info.hashedPassword);
 	m_secureStorage.setValue(user + "/salt", info.salt);
 	m_secureStorage.setValue(user + "/forceReset", info.forcePasswordReset);
+
+	QMap<QString, QVariant> metadata = m_secureStorage.value("metadata").toMap();
+	metadata["pwdChangedTime"] = QDateTime::currentDateTime();
+	m_secureStorage.setValue("metadata", metadata);
+
 	m_secureStorage.endGroup();
 
 	logActivity("用户密码重置：" + user);
@@ -446,6 +621,7 @@ void UserAuth::loadUserDatabase()
 		m_secureStorage.setValue("admin/role", static_cast<int>(adminInfo.role));
 		m_secureStorage.setValue("admin/mfa", adminInfo.requiresMFA);
 		m_secureStorage.setValue("admin/forceReset", adminInfo.forcePasswordReset);
+		m_secureStorage.setValue("admin/locked", adminInfo.isLocked);
 
 		m_users["admin"] = adminInfo;
 #ifndef PRODUCTION_BUILD // 仅开发环境输出临时密码
@@ -462,6 +638,7 @@ void UserAuth::loadUserDatabase()
 		info.role = static_cast<Role>(m_secureStorage.value("role", Guest).toInt());
 		info.requiresMFA = m_secureStorage.value("mfa", false).toBool();
 		info.forcePasswordReset = m_secureStorage.value("forceReset", false).toBool();
+		info.isLocked = m_secureStorage.value("locked", false).toBool();
 		m_secureStorage.endGroup();
 
 		m_users[user] = info;

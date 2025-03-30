@@ -37,6 +37,19 @@ public:
 		ForcePasswordReset
 	};
 
+	// 扩展的用户信息结构体（只读视图）
+	struct UserInfoEx {
+		Role role;                      // 用户角色
+		bool requiresMFA;               // MFA 启用状态
+		bool isLocked;                  // 账户是否锁定
+		bool forcePasswordReset;        // 是否需要强制重置密码
+		QDateTime lastLoginTime;        // 最后登录时间
+		QDateTime accountCreatedTime;   // 账户创建时间
+		QDateTime passwordLastChanged;  // 密码最后修改时间
+	};
+
+
+
 	explicit UserAuth(QObject* parent = nullptr);
 	~UserAuth();
 
@@ -48,12 +61,20 @@ public:
 	Role currentRole() const;
 	QList<QString> getAllUsers() const;
 
+	// 新增方法声明
+	UserInfoEx getUserInfoEx(const QString& username) const;
+	void recordLoginTime(const QString& username);  // 记录登录时间
+
+	QList<QString> getUsers(int page, int pageSize, const QString& keyword = "") const;
+	int getUserCount(const QString& keyword = "") const;
+
 	// 用户管理接口（仅管理员可调用）
 	bool createUser(const QString& user, Role role, const QString& tempPassword);
 	bool deleteUser(const QString& user);
 	bool unlockUser(const QString& username);
 	bool resetPassword(const QString& user, const QString& newPassword);
 	bool setUserRole(const QString& username, Role newRole);
+	bool updateUser(const QString& username, Role newRole, bool mfaEnabled, bool isLocked);
 
 	// 配置接口
 	void setPasswordPolicy(const QString& regex);
@@ -76,6 +97,7 @@ private:
 		Role role;
 		bool requiresMFA;
 		bool forcePasswordReset;
+		bool isLocked;
 	};
 
 	// 内部方法
@@ -89,6 +111,8 @@ private:
 	QString signLogEntry(const QString& log) const;
 	void resetSessionTimer(); // 新增会话重置方法
 	QByteArray getOrCreateHMACKey() const; // 密钥管理
+	void initializeUserCreationTime(const QString& username);
+
 
 	// 数据成员
 	QMap<QString, UserInfo> m_users;
